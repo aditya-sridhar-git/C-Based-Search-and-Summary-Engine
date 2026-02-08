@@ -30,11 +30,20 @@ export const ChatInterface: React.FC = () => {
     const [analyzeQuery, setAnalyzeQuery] = useState('');
     const [replaceWord, setReplaceWord] = useState('');
     const [analyzeAction, setAnalyzeAction] = useState<'freq' | 'search' | 'prefix' | 'replace' | 'topk'>('freq');
+    const [darkMode, setDarkMode] = useState(() => {
+        const saved = localStorage.getItem('theme');
+        return saved === 'dark';
+    });
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     // Load chat sessions from localStorage on mount AND sync with splay tree
+    useEffect(() => {
+        document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
+        localStorage.setItem('theme', darkMode ? 'dark' : 'light');
+    }, [darkMode]);
+
     useEffect(() => {
         const loadChats = async () => {
             // First load from localStorage for messages
@@ -583,6 +592,9 @@ export const ChatInterface: React.FC = () => {
             <aside className={`sidebar ${sidebarOpen ? 'open' : 'closed'}`}>
                 <div className="sidebar-header">
                     <h2>Mini Google</h2>
+                    <button onClick={() => setDarkMode(!darkMode)} className="theme-toggle-btn" title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
+                        {darkMode ? '☀️' : '🌙'}
+                    </button>
                     <button onClick={() => setSidebarOpen(!sidebarOpen)} className="toggle-btn">
                         {sidebarOpen ? '◀' : '▶'}
                     </button>
