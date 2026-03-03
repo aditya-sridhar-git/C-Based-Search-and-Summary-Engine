@@ -28,22 +28,66 @@ export const ChatInterface: React.FC = () => {
     const [uploadedDoc, setUploadedDoc] = useState<{ name: string, content: string } | null>(null);
     const [showAnalyzeModal, setShowAnalyzeModal] = useState(false);
     const [analyzeQuery, setAnalyzeQuery] = useState('');
-    const [analyzeAction, setAnalyzeAction] = useState<'freq' | 'search' | 'prefix'>('freq');
+    const [replaceWord, setReplaceWord] = useState('');
+    const [analyzeAction, setAnalyzeAction] = useState<'freq' | 'search' | 'prefix' | 'replace' | 'topk'>('freq');
+    const [darkMode, setDarkMode] = useState(() => {
+        const saved = localStorage.getItem('theme');
+        return saved === 'dark';
+    });
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    // Load chat sessions from localStorage on mount
+    // Load chat sessions from localStorage on mount AND sync with splay tree
     useEffect(() => {
-        const saved = localStorage.getItem('chatSessions');
-        if (saved) {
-            const sessions = JSON.parse(saved).map((s: any) => ({
-                ...s,
-                createdAt: new Date(s.createdAt),
-                messages: s.messages.map((m: any) => ({ ...m, timestamp: new Date(m.timestamp) }))
-            }));
-            setChatSessions(sessions);
-        }
+        document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
+        localStorage.setItem('theme', darkMode ? 'dark' : 'light');
+    }, [darkMode]);
+
+    useEffect(() => {
+        const loadChats = async () => {
+            // First load from localStorage for messages
+            const saved = localStorage.getItem('chatSessions');
+            if (saved) {
+                const sessions = JSON.parse(saved).map((s: any) => ({
+                    ...s,
+                    createdAt: new Date(s.createdAt),
+                    messages: s.messages.map((m: any) => ({ ...m, timestamp: new Date(m.timestamp) }))
+                }));
+                setChatSessions(sessions);
+            }
+
+            // Also try to load from splay tree (for ordering)
+            try {
+                const response = await fetch(`${API_BASE}/chats`);
+                const data = await response.json();
+                if (data.success && data.chats?.length > 0) {
+                    // Merge splay tree order with localStorage messages
+                    const savedData = saved ? JSON.parse(saved) : [];
+                    const orderedSessions = data.chats.map((chat: any) => {
+                        const localChat = savedData.find((s: any) => s.id === chat.id);
+                        if (localChat) {
+                            return {
+                                ...localChat,
+                                createdAt: new Date(chat.timestamp * 1000),
+                                messages: localChat.messages.map((m: any) => ({ ...m, timestamp: new Date(m.timestamp) }))
+                            };
+                        }
+                        return {
+                            id: chat.id,
+                            title: chat.title,
+                            messages: [],
+                            createdAt: new Date(chat.timestamp * 1000)
+                        };
+                    });
+                    setChatSessions(orderedSessions);
+                }
+            } catch (e) {
+                // Splay tree not available, use localStorage only
+                console.log('Splay tree not available, using localStorage');
+            }
+        };
+        loadChats();
     }, []);
 
     useEffect(() => {
@@ -54,6 +98,58 @@ export const ChatInterface: React.FC = () => {
     const saveChatSessions = (sessions: ChatSession[]) => {
         setChatSessions(sessions);
         localStorage.setItem('chatSessions', JSON.stringify(sessions));
+    };
+
+    // Sync chat to splay tree backend
+    const syncToSplayTree = async (chatId: string, title: string, timestamp?: number) => {
+        try {
+            await fetch(`${API_BASE}/chats`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id: chatId,
+                    title: title,
+                    timestamp: timestamp || Math.floor(Date.now() / 1000)
+                })
+            });
+        } catch (e) {
+            console.log('Failed to sync to splay tree');
+        }
+    };
+
+    // Notify splay tree of access (triggers splay operation) and reload list
+    const accessSplayTree = async (chatId: string) => {
+        try {
+            await fetch(`${API_BASE}/chats/${chatId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            // Reload chat list from splay tree to get new order
+            const response = await fetch(`${API_BASE}/chats`);
+            const data = await response.json();
+            if (data.success && data.chats?.length > 0) {
+                const savedData = JSON.parse(localStorage.getItem('chatSessions') || '[]');
+                const orderedSessions = data.chats.map((chat: any) => {
+                    const localChat = savedData.find((s: any) => s.id === chat.id);
+                    if (localChat) {
+                        return {
+                            ...localChat,
+                            createdAt: new Date(chat.timestamp * 1000),
+                            messages: localChat.messages.map((m: any) => ({ ...m, timestamp: new Date(m.timestamp) }))
+                        };
+                    }
+                    return {
+                        id: chat.id,
+                        title: chat.title,
+                        messages: [],
+                        createdAt: new Date(chat.timestamp * 1000)
+                    };
+                });
+                setChatSessions(orderedSessions);
+            }
+        } catch (e) {
+            console.log('Failed to access splay tree');
+        }
     };
 
     // Create a new chat session and return the new sessions array
@@ -71,8 +167,31 @@ export const ChatInterface: React.FC = () => {
         const newSessions = [newChat, ...chatSessions].slice(0, 20); // Keep max 20 chats
         saveChatSessions(newSessions);
         setCurrentChatId(chatId);
+
+        // Sync to splay tree
+        syncToSplayTree(chatId, title);
+
         return { chatId, newSessions };
     };
+
+    // Create a new chat with operation and document name as title
+    const createChatFromDocument = (docName: string, operation: string, firstMessage: Message): { chatId: string, newSessions: ChatSession[] } => {
+        const chatId = Date.now().toString();
+        const baseName = docName.replace('.txt', '');
+        const title = `${operation}: ${baseName}`; // e.g., "Replace: renewable_energy"
+        const newChat: ChatSession = {
+            id: chatId,
+            title,
+            messages: [firstMessage],
+            createdAt: new Date(),
+        };
+        const newSessions = [newChat, ...chatSessions].slice(0, 20);
+        saveChatSessions(newSessions);
+        setCurrentChatId(chatId);
+        syncToSplayTree(chatId, title);
+        return { chatId, newSessions };
+    };
+
 
     const handleSend = async () => {
         if (!input.trim() || isLoading) return;
@@ -171,31 +290,79 @@ export const ChatInterface: React.FC = () => {
     };
 
     const handleAnalyze = async () => {
-        if (!uploadedDoc || !analyzeQuery.trim()) return;
+        if (!uploadedDoc) return;
+
+        // For topk, no query needed. For replace, need both query and replaceWord
+        if (analyzeAction === 'replace' && (!analyzeQuery.trim() || !replaceWord.trim())) return;
+        if (analyzeAction !== 'topk' && analyzeAction !== 'replace' && !analyzeQuery.trim()) return;
 
         setShowAnalyzeModal(false);
 
+        const actionLabel = {
+            freq: 'Word Frequency',
+            search: 'Keyword Search',
+            prefix: 'Prefix Search',
+            replace: 'Replace All',
+            topk: 'Top 5 Words'
+        }[analyzeAction];
+
         const userMessage: Message = {
             id: Date.now().toString(),
-            text: `📄 ${uploadedDoc.name}\n\n🔍 ${analyzeAction === 'freq' ? 'Word Frequency' : analyzeAction === 'search' ? 'Keyword Search' : 'Prefix Search'}: "${analyzeQuery}"`,
+            text: analyzeAction === 'topk'
+                ? `📄 ${uploadedDoc.name}\n\n📊 ${actionLabel}`
+                : analyzeAction === 'replace'
+                    ? `📄 ${uploadedDoc.name}\n\n🔄 ${actionLabel}: "${analyzeQuery}" → "${replaceWord}"`
+                    : `📄 ${uploadedDoc.name}\n\n🔍 ${actionLabel}: "${analyzeQuery}"`,
             sender: 'user',
             timestamp: new Date(),
         };
-        setMessages(prev => [...prev, userMessage]);
+
+        // Create a new chat session using the operation and document name
+        if (!currentChatId) {
+            createChatFromDocument(uploadedDoc.name, actionLabel || 'Analysis', userMessage);
+        } else {
+            setMessages(prev => [...prev, userMessage]);
+        }
         setIsLoading(true);
 
         try {
-            const response = await fetch(`${API_BASE}/analyze`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    content: uploadedDoc.content,
-                    action: analyzeAction,
-                    query: analyzeQuery
-                }),
-            });
+            let response;
+            let data;
 
-            const data = await response.json();
+            if (analyzeAction === 'replace') {
+                response = await fetch(`${API_BASE}/replace`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        content: uploadedDoc.content,
+                        find: analyzeQuery,
+                        replace: replaceWord,
+                        filename: uploadedDoc.name
+                    }),
+                });
+                data = await response.json();
+            } else if (analyzeAction === 'topk') {
+                response = await fetch(`${API_BASE}/topk`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        content: uploadedDoc.content,
+                        k: 5
+                    }),
+                });
+                data = await response.json();
+            } else {
+                response = await fetch(`${API_BASE}/analyze`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        content: uploadedDoc.content,
+                        action: analyzeAction,
+                        query: analyzeQuery
+                    }),
+                });
+                data = await response.json();
+            }
 
             let resultText = '';
             if (data.error) {
@@ -230,6 +397,18 @@ export const ChatInterface: React.FC = () => {
                 } else {
                     resultText = `No words found with prefix "${data.prefix}"`;
                 }
+            } else if (analyzeAction === 'replace') {
+                resultText = `🔄 Replace All: "${data.original_word}" → "${data.replacement_word}"\n\n`;
+                resultText += `Occurrences replaced: ${data.occurrences_replaced}\n\n`;
+                if (data.occurrences_replaced > 0 && data.modified_text) {
+                    resultText += `Modified text:\n${data.modified_text}`;
+                }
+            } else if (analyzeAction === 'topk') {
+                resultText = `📊 Top ${data.k} Most Frequent Words\n\n`;
+                resultText += `Total unique words: ${data.total_unique_words}\n\n`;
+                data.top_words?.forEach((w: any, i: number) => {
+                    resultText += `${i + 1}. "${w.word}" - ${w.frequency} occurrences\n`;
+                });
             }
 
             const aiMessage: Message = {
@@ -251,8 +430,10 @@ export const ChatInterface: React.FC = () => {
             setIsLoading(false);
             setUploadedDoc(null);
             setAnalyzeQuery('');
+            setReplaceWord('');
         }
     };
+
 
     const handleSummarize = async () => {
         if (!uploadedDoc) return;
@@ -305,11 +486,17 @@ export const ChatInterface: React.FC = () => {
         }
     };
 
-    const clearHistory = () => {
+    const clearHistory = async () => {
         setChatSessions([]);
         setCurrentChatId(null);
         setMessages([]);
         localStorage.removeItem('chatSessions');
+        // Also clear splay tree backend
+        try {
+            await fetch(`${API_BASE}/chats/clear`, { method: 'POST' });
+        } catch (e) {
+            console.log('Failed to clear splay tree');
+        }
     };
 
     const newChat = () => {
@@ -322,6 +509,8 @@ export const ChatInterface: React.FC = () => {
         if (chat) {
             setCurrentChatId(chatId);
             setMessages(chat.messages);
+            // Trigger splay operation - recently accessed chats bubble up
+            accessSplayTree(chatId);
         }
     };
 
@@ -350,20 +539,37 @@ export const ChatInterface: React.FC = () => {
                                     <option value="freq">Word Frequency</option>
                                     <option value="search">Keyword Search</option>
                                     <option value="prefix">Prefix Search</option>
+                                    <option value="replace">Replace All</option>
+                                    <option value="topk">Top 5 Words</option>
                                 </select>
-                                <input
-                                    type="text"
-                                    value={analyzeQuery}
-                                    onChange={(e) => setAnalyzeQuery(e.target.value)}
-                                    placeholder="Enter word to search..."
-                                    className="analyze-input"
-                                />
+                                {analyzeAction !== 'topk' && (
+                                    <input
+                                        type="text"
+                                        value={analyzeQuery}
+                                        onChange={(e) => setAnalyzeQuery(e.target.value)}
+                                        placeholder={analyzeAction === 'replace' ? "Word to find..." : "Enter word to search..."}
+                                        className="analyze-input"
+                                    />
+                                )}
+                                {analyzeAction === 'replace' && (
+                                    <input
+                                        type="text"
+                                        value={replaceWord}
+                                        onChange={(e) => setReplaceWord(e.target.value)}
+                                        placeholder="Replace with..."
+                                        className="analyze-input"
+                                    />
+                                )}
                                 <button
                                     onClick={handleAnalyze}
-                                    disabled={!analyzeQuery.trim()}
+                                    disabled={
+                                        analyzeAction === 'topk' ? false :
+                                            analyzeAction === 'replace' ? (!analyzeQuery.trim() || !replaceWord.trim()) :
+                                                !analyzeQuery.trim()
+                                    }
                                     className="modal-btn analyze"
                                 >
-                                    🔍 Analyze
+                                    {analyzeAction === 'topk' ? '📊 Get Top 5' : analyzeAction === 'replace' ? '🔄 Replace All' : '🔍 Analyze'}
                                 </button>
                             </div>
                         </div>
@@ -386,6 +592,9 @@ export const ChatInterface: React.FC = () => {
             <aside className={`sidebar ${sidebarOpen ? 'open' : 'closed'}`}>
                 <div className="sidebar-header">
                     <h2>Mini Google</h2>
+                    <button onClick={() => setDarkMode(!darkMode)} className="theme-toggle-btn" title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
+                        {darkMode ? '☀️' : '🌙'}
+                    </button>
                     <button onClick={() => setSidebarOpen(!sidebarOpen)} className="toggle-btn">
                         {sidebarOpen ? '◀' : '▶'}
                     </button>
